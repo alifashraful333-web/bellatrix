@@ -160,7 +160,11 @@
       <button class="orb" id="orb" type="button" aria-label="Start or stop listening"></button>
     </div>
     <div class="status" id="status" role="status" aria-live="polite">Tap the orb and start talking.</div>
-    <div class="live" id="live" aria-hidden="true"></div>
+    <div class="live" id="live" aria-live="polite"></div>
+    <div class="quick" id="sendRow" hidden>
+      <button id="btnSend" type="button" class="primary">Done speaking: send</button>
+      <button id="btnClear" type="button">Clear</button>
+    </div>
     <div class="quick">
       <button type="button" data-say="Check my emails and give me an overview.">Check emails</button>
       <button type="button" data-say="What events do I have coming up?">My schedule</button>
@@ -273,6 +277,7 @@
     </select>
 
     <label class="check"><input type="checkbox" id="sWake"> Only respond when I say &ldquo;Bellatrix&rdquo; first</label>
+    <label class="check"><input type="checkbox" id="sManual"> Wait for me to tap Send (ignores pauses and background noise)</label>
 
     <label for="sPhrase">Lock screen</label>
     <button type="button" id="sPhrase">Set or change spoken passphrase</button>
@@ -303,7 +308,7 @@ const SCOPES = [
 
 const settings = {
   name: store.get("name"), key: "", model: store.get("model", DEFAULT_MODEL),
-  clientId: "", lang: store.get("lang", "en-US"), wake: store.get("wake") === "1"
+  clientId: "", lang: store.get("lang", "en-US"), wake: store.get("wake") === "1", manual: store.get("manual") === "1"
 };
 
 const tz = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) { return "local time"; } })();
@@ -342,10 +347,12 @@ function setState(s, msg) {
   state = s;
   $("#stage").dataset.state = s;
   const defaults = {
-    idle: "Tap the orb and start talking.", listening: "Listening…",
+    idle: "Tap the orb and start talking.",
+    listening: settings.manual ? "Listening… tap Send when you are done." : "Listening…",
     thinking: "Thinking…", speaking: "Speaking…"
   };
   $("#status").textContent = msg || defaults[s];
+  $("#sendRow").hidden = s !== "listening";
 }
 function refreshChips() {
   const ai = $("#chipAI");
@@ -861,23 +868,28 @@ if (synth) { try { synth.getVoices(); synth.onvoiceschanged = () => {}; } catch 
 /* ---------- speech in ---------- */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null, listening = false, busy = false, activeUntil = 0;
+let liveText = "", carryText = ""; // what she has heard so far for the current message
 
 function stopRec() {
   if (rec) { rec.onend = null; rec.onresult = null; rec.onerror = null; try { rec.abort(); } catch (e) {} rec = null; }
   $("#live").textContent = "";
 }
+function resetHeard() { liveText = ""; carryText = ""; $("#live").textContent = ""; }
 function armRec() {
   if (!listening || busy || rec || !SR) return;
   const r = new SR();
   r.continuous = true; r.interimResults = true; r.lang = settings.lang;
   r.onresult = (e) => {
-    let interim = "", final = "";
-    for (let i = e.resultIndex; i < e.results.length; i++) {
+    let all = "", final = "";
+    for (let i = 0; i < e.results.length; i++) {
       const t = e.results[i][0].transcript;
-      if (e.results[i].isFinal) final += t; else interim += t;
+      all += t + " ";
+      if (e.results[i].isFinal && i >= e.resultIndex) final += t + " ";
     }
-    $("#live").textContent = interim || final;
-    if (final.trim()) onHeard(final.trim());
+    liveText = (carryText + " " + all).replace(/\s+/g, " ").trim();
+    $("#live").textContent = liveText;
+    // Automatic mode answers when the microphone decides you paused. Manual mode only on Send.
+    if (!settings.manual && final.trim()) { const t = final.trim(); resetHeard(); onHeard(t); }
   };
   r.onerror = (e) => {
     if (e.error === "not-allowed" || e.error === "service-not-allowed") {
@@ -885,16 +897,22 @@ function armRec() {
       addLine("sys", "Microphone access was blocked. Allow the microphone for this site in your browser, then tap the orb again.");
     }
   };
-  r.onend = () => { rec = null; if (listening && !busy) setTimeout(armRec, 250); };
+  r.onend = () => {
+    rec = null;
+    if (settings.manual) carryText = liveText; // keep what you said if the browser restarts the microphone
+    if (listening && !busy) setTimeout(armRec, 250);
+  };
   rec = r;
   try { r.start(); } catch (e) { rec = null; }
 }
 
 const EXIT = /\b(stop listening|go to sleep|goodbye|good bye|shut down)\b/i;
-function onHeard(text) {
+function onHeard(text, forced) {
   let cmd = text;
   const wake = /\bbellatrix\b[,.!?]*\s*/i;
-  if (settings.wake) {
+  if (forced) {
+    cmd = text.replace(wake, "").trim() || text; // tapping Send counts as speaking to her
+  } else if (settings.wake) {
     const heardWake = wake.test(text);
     if (!heardWake && Date.now() > activeUntil) return;
     cmd = text.replace(wake, "").trim() || "I'm here.";
@@ -913,9 +931,22 @@ function startListening() {
   setState("listening");
   armRec();
 }
+$("#btnSend").addEventListener("click", () => {
+  const text = liveText.trim();
+  if (!text) { addLine("sys", "I have not heard anything yet. Speak, then tap Send."); return; }
+  resetHeard();
+  stopRec();
+  onHeard(text, true);
+});
+$("#btnClear").addEventListener("click", () => {
+  resetHeard();
+  stopRec();      // restart the microphone so background noise already heard is dropped
+  armRec();
+});
 function stopListening() {
   listening = false;
   $("#orb").setAttribute("aria-pressed", "false");
+  resetHeard();
   stopRec();
   if (!busy) setState("idle");
 }
@@ -927,7 +958,7 @@ function enqueue(fn) { chain = chain.then(fn).catch(() => {}); return chain; }
 let greeted = false;
 function handle(text) {
   return enqueue(async () => {
-    busy = true; stopRec();
+    busy = true; stopRec(); resetHeard();
     addLine("you", text);
     setState("thinking");
     let reply;
@@ -946,14 +977,17 @@ const dlg = $("#dlg");
 function openSettings() {
   $("#sName").value = settings.name; $("#sKey").value = settings.key; $("#sModel").value = settings.model;
   $("#sClient").value = settings.clientId; $("#sLang").value = settings.lang; $("#sWake").checked = settings.wake;
+  $("#sManual").checked = settings.manual;
   if (typeof dlg.showModal === "function") dlg.showModal(); else dlg.setAttribute("open", "");
 }
 $("#setForm").addEventListener("submit", async () => {
   settings.name = $("#sName").value.trim(); settings.key = $("#sKey").value.trim();
   settings.model = $("#sModel").value.trim() || DEFAULT_MODEL; settings.clientId = $("#sClient").value.trim();
-  settings.lang = $("#sLang").value; settings.wake = $("#sWake").checked;
+  settings.lang = $("#sLang").value; settings.wake = $("#sWake").checked; settings.manual = $("#sManual").checked;
   for (const k of ["name", "model", "lang"]) store.set(k, settings[k]);
   store.set("wake", settings.wake ? "1" : "0");
+  store.set("manual", settings.manual ? "1" : "0");
+  if (state === "listening") setState("listening");
   await secret.set("key", settings.key);          // keys are saved encrypted
   await secret.set("clientId", settings.clientId);
   refreshChips();
